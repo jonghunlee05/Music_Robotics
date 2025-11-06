@@ -4,7 +4,6 @@
 #define SDA_PIN 21
 #define SCL_PIN 22
 #define MPU_ADDR 0x68   // your board responds here
-// Not a typo: WHO_AM_I was 0x70 (MPU-6500 family). Data regs are compatible.
 
 static const uint8_t REG_PWR_MGMT_1   = 0x6B;
 static const uint8_t REG_SMPLRT_DIV   = 0x19;
@@ -17,9 +16,7 @@ static const uint8_t REG_GYRO_XOUT_H  = 0x43;
 static const uint8_t REG_WHO_AM_I     = 0x75;
 
 // ---- chosen ranges
-// ACCEL: 0=±2g, 1=±4g, 2=±8g, 3=±16g
 #define ACCEL_FS_SEL 0   // ±2g
-// GYRO:  0=±250, 1=±500, 2=±1000, 3=±2000 dps
 #define GYRO_FS_SEL  0   // ±250 dps
 
 // sensitivity LSB per unit for chosen ranges
@@ -61,6 +58,43 @@ void robustSerialBegin(unsigned long baud = 115200) {
 float pitch_deg = 0.0f, roll_deg = 0.0f;
 unsigned long last_ms = 0;
 
+// ---- hit detection state
+// We detect a hit when |a| spikes noticeably above 1g (gravity).
+// Very cheap high-pass by subtracting a slow EMA of |a|.
+float a_mag_ema = 1.0f;         // tracks gravity baseline ~1g
+const float A_EMA_ALPHA = 0.02f; // lower = slower baseline
+const float HIT_THRESH_G = 0.35f; // spike above baseline (g units) that counts as a hit
+const unsigned HIT_REFRACT_MS = 120; // minimum gap between hits
+unsigned long last_hit_ms = 0;
+float last_spike_g = 0.0f;
+
+// Optional: require downward-ish swing to reduce false positives
+// We check if az component dips below gravity meaning hand is accelerating down.
+const float DOWN_G_EXTRA = -0.20f; // require az_g < (1.0 + DOWN_G_EXTRA) at impact
+
+// Map spike height to 1..127 "velocity"
+int spikeToMidi(float spike_g) {
+  float v = spike_g;               // ~0.35 .. maybe 2.0 on big swings
+  if (v < 0) v = 0;
+  float scaled = v * 90.0f + 20.0f; // crude mapping
+  if (scaled < 1) scaled = 1;
+  if (scaled > 127) scaled = 127;
+  return (int)scaled;
+}
+
+// Decide which drum based on orientation at hit moment
+const char* mapZone(float roll, float pitch) {
+  // Priority: if you tip the stick steeply down (pitch very negative), call it Kick
+  if (pitch < -60.0f) return "Kick";
+
+  if (roll < -20.0f)       return "Tom1";
+  else if (roll > 20.0f)   return "HiHat";
+  else                     return "Snare";
+}
+
+// ---- optional: print raw for debugging
+const bool VERBOSE_STREAM = false;
+
 void setup() {
   robustSerialBegin(115200);
 
@@ -84,6 +118,9 @@ void setup() {
 
   // Prime filter timestamp
   last_ms = millis();
+
+  // Prime magnitude EMA with 1g
+  a_mag_ema = 1.0f;
 }
 
 void loop() {
@@ -112,6 +149,7 @@ void loop() {
   // Complementary filter for roll/pitch (yaw needs mag or integration drift handling)
   unsigned long now = millis();
   float dt = (now - last_ms) / 1000.0f;
+  if (dt <= 0) dt = 0.001f;
   last_ms = now;
 
   // accel tilt estimate (degrees)
@@ -127,10 +165,42 @@ void loop() {
   pitch_deg = alpha * pitch_deg + (1 - alpha) * pitch_acc;
   roll_deg  = alpha * roll_deg  + (1 - alpha) * roll_acc;
 
-  Serial.printf(
-    "A[g]=[%6.3f %6.3f %6.3f]  G[dps]=[%7.2f %7.2f %7.2f]  T=%5.2fC  R=%.1f P=%.1f\n",
-    ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, temp_c, roll_deg, pitch_deg
-  );
+  // ----- HIT DETECTOR -----
+  // Magnitude of acceleration in g
+  float a_mag = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
 
-  delay(50); // ~20 Hz
+  // Update slow EMA baseline
+  a_mag_ema = (1.0f - A_EMA_ALPHA) * a_mag_ema + A_EMA_ALPHA * a_mag;
+
+  // Spike above baseline
+  float spike_g = a_mag - a_mag_ema;
+
+  // Optional downward check
+  bool downwardish = (az_g < 1.0f + DOWN_G_EXTRA);
+
+  // Decide hit
+  bool ready = (now - last_hit_ms) > HIT_REFRACT_MS;
+  if (ready && (spike_g > HIT_THRESH_G) && downwardish) {
+    last_hit_ms = now;
+    last_spike_g = spike_g;
+
+    // Map orientation to a zone at the moment of impact
+    const char* zone = mapZone(roll_deg, pitch_deg);
+    int vel = spikeToMidi(spike_g);
+
+    Serial.printf("HIT: %s (vel=%d)  roll=%.1f pitch=%.1f spike=%.2fg\n",
+                  zone, vel, roll_deg, pitch_deg, spike_g);
+  }
+
+  // ---- optional verbose stream for tuning ----
+  if (VERBOSE_STREAM) {
+    Serial.printf(
+      "A[g]=[%6.3f %6.3f %6.3f] |a|=%.3f ema=%.3f sp=%.3f  "
+      "G[dps]=[%7.2f %7.2f %7.2f]  T=%5.2fC  R=%.1f P=%.1f\n",
+      ax_g, ay_g, az_g, a_mag, a_mag_ema, spike_g,
+      gx_dps, gy_dps, gz_dps, temp_c, roll_deg, pitch_deg
+    );
+  }
+
+  delay(5); // higher rate helps hit timing; still cheap on ESP32
 }
